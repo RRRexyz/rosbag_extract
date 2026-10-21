@@ -1,0 +1,7 @@
+{
+  "pythonVersion": "3.8",
+  "typeCheckingMode": "basic",
+  "include": ["extract_frames.py", "rosbag_extract", "tests"],
+  "extraPaths": ["/opt/ros/noetic/lib/python3/dist-packages"],
+  "useLibraryCodeForTypes": false
+}
