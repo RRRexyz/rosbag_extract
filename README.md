@@ -28,17 +28,24 @@ python3 -c "import rosbag, genpy, sensor_msgs.msg, cv2, numpy; print('ok')"
 
 ```
 rosbag_extract/
-├── extract_frames.py            # 命令行入口
+├── extract_frames.py            # 命令行入口（图像 + 点云）
+├── extract_btc_input.py         # btc_desc 输入生成入口（PCD + pose）
+├── check_btc_input.py           # btc_desc 输入自检
 ├── rosbag_extract/
 │   ├── bag_index.py             # bag 索引：按话题列时间戳 / 按索引精确读取单条消息
 │   ├── lidar.py                 # livox_ros_driver/CustomMsg -> numpy 点云
 │   ├── camera.py                # CompressedImage 解码 / 写 jpg（原始字节直存）
 │   ├── pcd.py                   # PCD v0.7 写出（binary / ascii）
-│   └── pairing.py               # 图像与点云的时间戳配对
-├── tests/test_offline.py        # 不依赖 bag 的单元测试
-├── pyrightconfig.json           # Pylance / pyright 配置（见第 6 节）
+│   ├── pairing.py               # 图像与点云的时间戳配对
+│   ├── odometry.py              # 四元数 / 4x4 位姿 / li_extrinsic 解析
+│   └── btc_input.py             # btc_desc 数据集生成（PCD + pose + config）
+├── tests/
+│   ├── test_offline.py          # 不依赖 bag 的单元测试
+│   └── test_btc_input.py        # btc_desc 输入生成的离线单测
+├── pyrightconfig.json           # Pylance / pyright 配置（见第 7 节）
 ├── requirements.txt
-└── output/                      # ← 提取结果（见第 5 节）
+├── output/                      # ← 图像/点云提取结果（见第 5 节）
+└── btc_input/                   # ← btc_desc 输入数据集（见第 6 节）
 ```
 
 ## 3. 快速开始
@@ -163,14 +170,107 @@ pcl_viewer output/pcd/frame_000000.pcd
 python3 -c "import open3d as o3d; o3d.visualization.draw_geometries([o3d.io.read_point_cloud('output/pcd/frame_000000.pcd')])"
 ```
 
-## 6. 单元测试与类型检查（VSCode / Pylance）
+## 6. 生成 btc_desc 输入（PCD + pose）
+
+`extract_btc_input.py` 把 `building03.bag` 的原始 Livox 点云与
+`lio_building03.bag` 的 `/Odometry` 合成 btc_desc 需要的三样输入：
+`velodyne/%06d.pcd`、`pose.txt`、`config.yaml`。它是**新增入口**，
+不改 `extract_frames.py`、现有 `rosbag_extract/` 模块与 `output/` 里的结果。
+
+```bash
+cd ~/project/rosbag_extract
+
+# 只看会写多少帧、跳过多少帧，不落盘
+python3 extract_btc_input.py --dry-run
+
+# 先生成 3 帧到临时目录，跑通后再全量
+python3 extract_btc_input.py --limit 3 --output-dir btc_input/demo --clean
+python3 check_btc_input.py --data btc_input/demo
+
+# 全量：1707 帧，约 0.6 GB
+python3 extract_btc_input.py --output-dir btc_input/building03 --clean
+python3 check_btc_input.py --data btc_input/building03
+```
+
+默认值：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--lidar-bag` | `/home/rex/data/shitong/building/building03.bag` | 原始 Livox 点云 bag |
+| `--odom-bag` | `/home/rex/data/shitong/building/lio_building03.bag` | LIO 输出 bag |
+| `--calibration` | `/home/rex/data/shitong/building/building.yaml` | 读 `li_extrinsic`（`R_i_l`/`t_i_l`） |
+| `--output-dir` | `<项目>/btc_input/building03` | 输出根目录 |
+| `--lidar-topic` | `/livox/lidar` | 点云话题（`livox_ros_driver/CustomMsg`） |
+| `--odom-topic` | `/Odometry` | 位姿话题（`nav_msgs/Odometry`） |
+| `--max-time-diff` | `0.02` | 点云与里程计按 `header.stamp` 配对的最大时间差（秒） |
+| `--pcd-format` | `binary` | `binary` 或 `ascii` |
+| `--scene` | `indoor` | 决定 `config.yaml` 复制室内还是室外模板 |
+| `--start` / `--end` / `--step` | 全部 | 按 raw 帧下标选帧 |
+| `--limit` | `0`（不限制） | 最多写多少帧，便于试跑 |
+| `--keep-zero-points` | 关 | 保留 `(0,0,0)` 无回波点 |
+| `--clean` | 关 | 先清空旧的 PCD/元数据；输出目录已有 PCD 时不加会报错 |
+| `--dry-run` | 关 | 只统计，不写文件 |
+| `--list-topics` | 关 | 列出两个 bag 的话题后退出 |
+
+输出布局：
+
+```
+btc_input/building03/
+├── velodyne/000000.pcd … 001706.pcd   # 连续编号，read_bin=false 时读取
+├── pose.txt                           # id x y z qx qy qz qw（单空格，w 最后）
+├── config.yaml                        # 按 --scene 选中的模板
+├── config_indoor.yaml                 # 室内模板
+├── config_outdoor.yaml                # 室外模板
+├── meta.csv                           # 每帧对应的 raw/odom 下标与时间戳
+├── run_params.yaml                    # 可直接 rosparam load
+└── dataset.json                       # 数据源、外参、统计与警告
+```
+
+几个关键约定：
+
+- **位姿语义**是 `T_world_lidar`：`p_world = R * p_lidar + t`，点云仍保存在
+  `livox_frame` 传感器系，不预先乘位姿。`T_world_lidar = T_world_body @ T_body_lidar`，
+  `T_body_lidar` 来自标定的 `li_extrinsic`（本数据 `R_i_l = I`，
+  `t_i_l = [0.04165, 0.02326, -0.0284]`）。
+- **帧号重排**：btc 要求 `%06d` 从 `000000` 连续，脚本把匹配到里程计的 raw 帧
+  重新编号；原始 raw 帧号、两个 header 时间戳、`dt_ms`、点数都记在 `meta.csv`。
+- **默认跳过前 5 帧**：`building03.bag` 前 5 条点云没有 20 ms 内的 `/Odometry`
+  （LIO 预热），所以 1712 条 raw 点云写出 1707 帧。
+- **PCD**：`FIELDS x y z intensity`、`SIZE 4 4 4 4`、`TYPE F F F F`、`DATA binary`，
+  默认剔除 `(0,0,0)` 与 NaN/Inf；每帧约 1.3–2.4 万点（平均约 2.2 万）。
+- **配置**：`config.yaml`、`config_indoor.yaml`、`config_outdoor.yaml` 首行都是
+  `%YAML:1.0`；键名沿用 btc 源码里的 `max_constrait_dis`（不是 `constraint`）。
+  `run_params.yaml` 里 `read_bin: false`，其余是 `pcds_dir` / `pose_file` /
+  `setting_path` / `cloud_overlap_thr`。
+
+生成后运行 btc_desc（需要 ROS master）：
+
+```bash
+source /home/rex/project/btc_descriptor/devel/setup.bash
+roscore                                  # 另开一个终端，必须先启动
+rosparam load btc_input/building03/run_params.yaml
+rosrun btc_desc btc_place_recognition
+```
+
+`check_btc_input.py` 会检查 PCD 编号连续性、PCD 头/长度、pose 的 8 列单空格/
+单位四元数/轨迹连续性、帧数一致性、config 首行与 25 个关键键、`run_params.yaml`
+的 `read_bin=false`，以及 `meta.csv` 行数；短序列出现
+`skip_near_num >= 帧数` 的 WARN 是正常的。
+
+本机实测（1707 帧，indoor 配置）：`btc_place_recognition` 正常读完 1707 帧并退出，
+触发 116 次候选回环、99 次真回环，平均 24.6 ms/帧；少量 `No STDescs!` 来自没有
+有效描述子的帧，不影响整体流程。
+
+## 7. 单元测试与类型检查（VSCode / Pylance）
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
 覆盖 PCD 读写往返（binary/ascii/空点云）、时间戳配对（精确命中只读 1 条、记录时间有偏时复核、
-边界截断）、CustomMsg 解析（剔除 `(0,0,0)`、时间戳异常退化）等，不依赖 bag 文件。
+边界截断）、CustomMsg 解析（剔除 `(0,0,0)`、时间戳异常退化），以及 btc 输入生成
+（四元数/矩阵往返、`li_extrinsic` 解析、位姿行格式、里程计配对、config/meta 写出）等，
+共 27 个用例，不依赖 bag 文件。
 
 类型检查用项目自带的 `pyrightconfig.json`（Pylance 打开工程时会自动读取）：
 
@@ -191,10 +291,12 @@ pyright                 # 0 errors, 0 warnings
 改完 `pyrightconfig.json` 后，在 VSCode 里执行 `Ctrl+Shift+P → Developer: Reload Window`
 （或 `Python: Restart Language Server`）让 Pylance 重新加载配置。
 
-## 7. 说明与限制
+## 8. 说明与限制
 
 - 只做「取帧 + 配对」，不做去畸变、不下采样、不做点云到图像的投影；
   `../data/shitong/campus/campus.yaml` 中有 `li_extrinsic` / `ci_extrinsic` 与相机内参，可用于后续投影。
+- `extract_btc_input.py` 只做「raw 点云 + LIO 位姿 -> btc_desc 输入」的格式转换，
+  不重新建图、不去畸变、不下采样；位姿质量取决于 `lio_building03.bag`。
 - 点云是 Livox 帧坐标系（`frame_id: livox_frame`），未转换到 IMU 或相机坐标系。
 - 每帧 24096 个原始点中约 2000 个是 `(0,0,0)` 无回波点，默认剔除；`--keep-zero-points` 可保留。
 - `--all` 会读完整 8 GB 点云并解码 3496 张 2592x1944 图像，实测约 0.13 s/帧

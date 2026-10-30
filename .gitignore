@@ -2,3 +2,5 @@ __pycache__/
 *.py[cod]
 
 output/
+btc_input/
+*.pcd.tmp
